@@ -24,13 +24,30 @@ const std = @import("std");
 const rl = @import("raylib");
 
 const expect = std.testing.expect;
-const Vec3 = struct { x: f32, y: f32, z: f32 };
+
+const COS30: f32 = 0.86602540378;
+const SIN30: f32 = 0.5;
+
+const Color = struct {
+    value: rl.Color,
+    r: i32,
+    g: i32,
+    b: i32,
+};
+
+const Vec3 = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    // color: rl.Color,
+    color: Color,
+};
 
 fn mapToArrayAlloc(alloc: std.mem.Allocator, mapPath: []u8) !std.ArrayList(std.ArrayList(Vec3)) {
     const file = try std.fs.cwd().openFile(mapPath, .{});
     defer file.close();
 
-    const content: []u8 = file.readToEndAlloc(alloc, 1e6) catch |e| {
+    const content: []u8 = file.readToEndAlloc(alloc, 1e9) catch |e| {
         std.log.debug("Canno't read file: {s}: cause: {!}", .{ mapPath, e });
         return error.FileTooBig;
     };
@@ -54,10 +71,29 @@ fn mapToArrayAlloc(alloc: std.mem.Allocator, mapPath: []u8) !std.ArrayList(std.A
         while (items.next()) |item| {
             defer x += 1;
 
+            var parsed_item = std.mem.tokenizeScalar(u8, item, ',');
+            var peek_str: []const u8 = "0";
+            var color: [8]u8 = .{ '0', 'x', 'F', 'F', 'F', 'F', 'F', 'F' };
+
+            if (parsed_item.next()) |value| peek_str = value;
+            if (parsed_item.next()) |value| {
+                @memcpy(color[0..], value);
+                // std.debug.print("{s}\n\n", .{color});
+            }
+            // const peek_str = parsed_item.next() orelse return error.MissingZ;
+            // const color: ?[]const u8 = parsed_item.next();
+            const parsed_color = try std.fmt.parseInt(u32, color[0..], 0);
+
             try lineArray.append(.{
                 .x = x,
                 .y = y,
-                .z = try std.fmt.parseFloat(f32, item),
+                .z = try std.fmt.parseFloat(f32, peek_str),
+                .color = .{
+                    .value = rl.Color.fromInt(parsed_color),
+                    .r = @as(u8, @intCast((parsed_color >> 16) & 0xFF)),
+                    .g = @as(u8, @intCast((parsed_color >> 8) & 0xFF)),
+                    .b = @as(u8, @intCast((parsed_color) & 0xFF)),
+                },
             });
         }
         try mapArray.append(lineArray);
@@ -78,6 +114,7 @@ const ViewParams = struct {
     y_offset: f32,
     forced_size: f32,
     custom_size: f32,
+    size: f32,
     x_rotation: f32, //radian
     y_rotation: f32, //radian
     z_rotation: f32, //radian
@@ -93,7 +130,51 @@ fn getRawContent(grid: std.ArrayList(std.ArrayList(Vec3)), i: usize, j: usize) R
     };
 }
 
-fn drawMap(mapAllocated: std.ArrayList(std.ArrayList(Vec3)), viewParams: ViewParams) void {
+fn getGradientColor(a: Color, b: Color, t: f32) rl.Color {
+    return rl.Color{
+        .r = @intFromFloat(std.math.lerp(@as(f32, @floatFromInt(a.r)), @as(f32, @floatFromInt(b.r)), t)),
+        .g = @intFromFloat(std.math.lerp(@as(f32, @floatFromInt(a.g)), @as(f32, @floatFromInt(b.g)), t)),
+        .b = @intFromFloat(std.math.lerp(@as(f32, @floatFromInt(a.b)), @as(f32, @floatFromInt(b.b)), t)),
+        .a = 255,
+    };
+}
+
+fn drawLineGradient(img: *rl.Image, a: Vec3, b: Vec3) !void {
+    const dx: f32 = b.x - a.x;
+    const dy: f32 = b.y - a.y;
+    const gradient: bool = (a.color.value.toInt() != b.color.value.toInt());
+
+    const steps: f32 = @max(@abs(dx), @abs(dy));
+
+    const step_x: f32 = dx / steps;
+    const step_y: f32 = dy / steps;
+
+    var x: f32 = a.x;
+    var y: f32 = a.y;
+
+    var i: usize = 0;
+
+    //for
+    while (i < @as(usize, @intFromFloat(steps))) : (i += 1) {
+        const color = if (gradient) getGradientColor(a.color, b.color, @as(f32, @floatFromInt(i)) / steps) else rl.Color{
+            .r = @intCast(a.color.r),
+            .g = @intCast(a.color.g),
+            .b = @intCast(a.color.b),
+            .a = 255,
+        };
+
+        rl.imageDrawPixel(img, @intFromFloat(x), @intFromFloat(y), color);
+
+        x += step_x;
+        y += step_y;
+    }
+}
+
+fn isPointInScreen(point: Vec3, width: f32, height: f32) bool {
+    return (point.x > 0 and point.x < width and point.y > 0 and point.y < height);
+}
+
+fn drawMap(img: *rl.Image, mapAllocated: std.ArrayList(std.ArrayList(Vec3))) !void {
     var ctx: RawContent = undefined;
     var j: usize = 0;
     var i: usize = 0;
@@ -107,11 +188,11 @@ fn drawMap(mapAllocated: std.ArrayList(std.ArrayList(Vec3)), viewParams: ViewPar
             defer j += 1;
             ctx = getRawContent(mapAllocated, i, j);
 
-            if (ctx.right != null) {
-                rl.drawLine(@intFromFloat(viewParams.x_offset + ctx.center.?.x * (viewParams.forced_size * viewParams.custom_size)), @intFromFloat(viewParams.y_offset + ctx.center.?.y * (viewParams.forced_size * viewParams.custom_size)), @intFromFloat(viewParams.x_offset + ctx.right.?.x * (viewParams.forced_size * viewParams.custom_size)), @intFromFloat(viewParams.y_offset + ctx.right.?.y * (viewParams.forced_size * viewParams.custom_size)), .white);
+            if (ctx.right != null and isPointInScreen(ctx.center.?, 800, 800) and isPointInScreen(ctx.right.?, 800, 800)) {
+                try drawLineGradient(img, ctx.center.?, ctx.right.?);
             }
-            if (ctx.down != null) {
-                rl.drawLine(@intFromFloat(viewParams.x_offset + ctx.center.?.x * (viewParams.forced_size * viewParams.custom_size)), @intFromFloat(viewParams.y_offset + ctx.center.?.y * (viewParams.forced_size * viewParams.custom_size)), @intFromFloat(viewParams.x_offset + ctx.down.?.x * (viewParams.forced_size * viewParams.custom_size)), @intFromFloat(viewParams.y_offset + ctx.down.?.y * (viewParams.forced_size * viewParams.custom_size)), .white);
+            if (ctx.down != null and isPointInScreen(ctx.center.?, 800, 800) and isPointInScreen(ctx.down.?, 800, 800)) {
+                try drawLineGradient(img, ctx.center.?, ctx.down.?);
             }
 
             if (ctx.right == null) break;
@@ -121,51 +202,44 @@ fn drawMap(mapAllocated: std.ArrayList(std.ArrayList(Vec3)), viewParams: ViewPar
     }
 }
 
-fn rotateMapY(mapClone: std.ArrayList(std.ArrayList(Vec3)), teta: f32) void {
-    for (mapClone.items) |row| {
-        for (row.items) |*point| {
-            const old_x = point.x;
-            const old_z = point.z;
+fn rotatePointY(point: *Vec3, teta: f32) void {
+    const old_x = point.x;
+    const old_z = point.z;
 
-            point.x = (old_x * std.math.cos(teta)) + (old_z * std.math.sin(teta));
-            point.z = (old_x * -std.math.sin(teta)) + (old_z * std.math.cos(teta));
-        }
-    }
+    point.x = (old_x * std.math.cos(teta)) + (old_z * std.math.sin(teta));
+    point.z = (old_x * -std.math.sin(teta)) + (old_z * std.math.cos(teta));
 }
 
-fn rotateMapX(mapClone: std.ArrayList(std.ArrayList(Vec3)), teta: f32) void {
-    for (mapClone.items) |row| {
-        for (row.items) |*point| {
-            const old_y = point.y;
-            const old_z = point.z;
+fn rotatePointZ(point: *Vec3, teta: f32) void {
+    const old_x = point.x;
+    const old_y = point.y;
 
-            point.y = (old_y * std.math.cos(teta)) + (old_z * -std.math.sin(teta));
-            point.z = (old_y * std.math.sin(teta)) + (old_z * std.math.cos(teta));
-        }
-    }
+    point.x = (old_x * std.math.cos(teta)) - (old_y * std.math.sin(teta));
+    point.y = (old_x * std.math.sin(teta)) + (old_y * std.math.cos(teta));
 }
 
-fn rotateMapZ(mapClone: std.ArrayList(std.ArrayList(Vec3)), teta: f32) void {
-    for (mapClone.items) |row| {
-        for (row.items) |*point| {
-            const old_x = point.x;
-            const old_y = point.y;
+fn rotatePointX(point: *Vec3, teta: f32) void {
+    const old_y = point.y;
+    const old_z = point.z;
 
-            point.x = (old_x * std.math.cos(teta)) - (old_y * std.math.sin(teta));
-            point.y = (old_x * std.math.sin(teta)) + (old_y * std.math.cos(teta));
-        }
-    }
+    point.y = (old_y * std.math.cos(teta)) + (old_z * -std.math.sin(teta));
+    point.z = (old_y * std.math.sin(teta)) + (old_z * std.math.cos(teta));
 }
 
-fn projectMap(mapClone: std.ArrayList(std.ArrayList(Vec3))) void {
+fn projectPoint(point: *Vec3) void {
+    const old_x = point.x;
+    const old_y = point.y;
+    const old_z = point.z;
+
+    point.x = (old_x - old_y) * COS30;
+    point.y = (old_x + old_y) * SIN30 - old_z;
+}
+
+fn applyViewParams(mapClone: std.ArrayList(std.ArrayList(Vec3)), viewParams: ViewParams) void {
     for (mapClone.items) |row| {
         for (row.items) |*point| {
-            const old_x = point.x;
-            const old_y = point.y;
-            const old_z = point.z;
-
-            point.x = (std.math.sqrt(3) * 0.5) * (old_x - old_z);
-            point.y = (old_x + old_z) * 0.5 + old_y;
+            point.x = point.x * viewParams.size + viewParams.x_offset;
+            point.y = point.y * viewParams.size + viewParams.y_offset;
         }
     }
 }
@@ -203,46 +277,14 @@ fn centerMap(mapClone: std.ArrayList(std.ArrayList(Vec3)), viewParams: *ViewPara
     var largest_diff: f32 = undefined;
     if (right_left > down_up) {
         largest_diff = right_left;
-        viewParams.forced_size = 800 / largest_diff;
-        viewParams.y_offset = (800 - (down_up * viewParams.forced_size)) * 0.5;
     } else {
         largest_diff = down_up;
-        viewParams.forced_size = 800 / largest_diff;
-        viewParams.x_offset = (800 - (right_left * viewParams.forced_size)) * 0.5;
-        viewParams.y_offset = -up * viewParams.forced_size;
     }
-    std.debug.print(
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\
-        \\Map Bounds:
-        \\  Left   : {d:.2}
-        \\  Right  : {d:.2}
-        \\  Up     : {d:.2}
-        \\  Down   : {d:.2}
-        \\  Width  : {d:.2}
-        \\  Height : {d:.2}
-        \\  Up_Down: {d:.2}
-        \\  Right_l: {d:.2}
-        \\
-        \\View Params:
-        \\  Forced Size : {d:.2}
-        \\  X Offset    : {d:.2}
-        \\  Y Offset    : {d:.2}
-        \\
-    , .{ left, right, up, down, right_left, down_up, down_up, right_left, viewParams.forced_size, viewParams.x_offset, viewParams.y_offset });
+
+    viewParams.forced_size = 800 / largest_diff;
+    viewParams.size = viewParams.forced_size * viewParams.custom_size;
+    viewParams.x_offset = ((800 - (right_left * viewParams.size)) * 0.5) - (left * viewParams.size);
+    viewParams.y_offset = (800 - (down_up * viewParams.size)) * 0.5 - (up * viewParams.size);
 }
 
 fn captureKey(viewParams: *ViewParams) void {
@@ -267,7 +309,10 @@ fn captureKey(viewParams: *ViewParams) void {
         rl.KeyboardKey.s => viewParams.y_offset += 10,
         rl.KeyboardKey.a => viewParams.x_offset -= 10,
         rl.KeyboardKey.d => viewParams.x_offset += 10,
-        rl.KeyboardKey.left_bracket => viewParams.custom_size -= 0.2,
+        rl.KeyboardKey.left_bracket => {
+            if (viewParams.custom_size > 0.2)
+                viewParams.custom_size -= 0.2;
+        },
         rl.KeyboardKey.right_bracket => viewParams.custom_size += 0.2,
         rl.KeyboardKey.up => viewParams.x_rotation += rad_2,
         rl.KeyboardKey.down => viewParams.x_rotation -= rad_2,
@@ -284,6 +329,17 @@ fn captureKey(viewParams: *ViewParams) void {
     }
 }
 
+fn computeMap(map: std.ArrayList(std.ArrayList(Vec3)), viewParams: *ViewParams) void {
+    for (map.items) |row| {
+        for (row.items) |*point| {
+            rotatePointX(point, viewParams.x_rotation);
+            rotatePointY(point, viewParams.y_rotation);
+            rotatePointZ(point, viewParams.z_rotation);
+            projectPoint(point);
+        }
+    }
+}
+
 fn run(mapAllocated: std.ArrayList(std.ArrayList(Vec3))) !void {
     const screenWidth = 800;
     const screenHeight = 800;
@@ -293,12 +349,14 @@ fn run(mapAllocated: std.ArrayList(std.ArrayList(Vec3))) !void {
         .y_offset = 0,
         .custom_size = 1,
         .forced_size = 1,
+        .size = 1,
         .x_rotation = 5,
         .y_rotation = 2,
         .z_rotation = 3.1,
     };
 
-    rl.initWindow(screenWidth, screenHeight, "test");
+    rl.initWindow(screenWidth, screenHeight, "fdf");
+    var img = rl.genImageColor(800, 800, .black);
     defer rl.closeWindow();
 
     while (!rl.windowShouldClose()) {
@@ -318,30 +376,21 @@ fn run(mapAllocated: std.ArrayList(std.ArrayList(Vec3))) !void {
         captureKey(&viewParams);
 
         rl.beginDrawing();
-        rl.setTargetFPS(60);
+        rl.setTargetFPS(10000);
+
+        computeMap(mapClone, &viewParams);
+        centerMap(mapClone, &viewParams);
+        applyViewParams(mapClone, viewParams);
+
+        try drawMap(&img, mapClone);
+        const texture = try rl.loadTextureFromImage(img);
+        rl.drawTexture(texture, 0, 0, .white);
+
         defer {
             rl.endDrawing();
-            rl.clearBackground(.black);
+            rl.imageClearBackground(&img, .black);
+            rl.unloadTexture(texture);
         }
-
-        // const mousePos = rl.getMousePosition();
-        // const x: i32 = @intFromFloat(mousePos.x);
-        // const y: i32 = @intFromFloat(mousePos.y);
-
-        rotateMapX(mapClone, viewParams.x_rotation);
-        rotateMapY(mapClone, viewParams.y_rotation);
-        rotateMapZ(mapClone, viewParams.z_rotation);
-
-        projectMap(mapClone);
-
-        centerMap(mapClone, &viewParams);
-
-        // std.debug.print("{any}\n", .{viewParams});
-
-        // rotateMapX(mapClone, 10);
-        drawMap(mapClone, viewParams);
-
-        // rl.drawPixel(x, y, .white);
         rl.drawFPS(600, 600);
     }
 }
@@ -354,6 +403,8 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    rl.setTraceLogLevel(rl.TraceLogLevel.fatal);
+
     if (args.len > 1) {
         const mapAllocated = try mapToArrayAlloc(allocator, args[1]);
         defer {
@@ -362,30 +413,4 @@ pub fn main() !void {
         }
         try run(mapAllocated);
     }
-
-    // const screenWidth = 800;
-    // const screenHeight = 800;
-    //
-    // rl.initWindow(screenWidth, screenHeight, "test");
-    // defer rl.closeWindow();
-    //
-    // while (!rl.windowShouldClose()) {
-    //     rl.beginDrawing();
-    //
-    //     rl.setTargetFPS(240);
-    //
-    //     defer {
-    //         rl.endDrawing();
-    //         rl.clearBackground(.black);
-    //     }
-    //
-    //     const mousePos = rl.getMousePosition();
-    //     const x: i32 = @intFromFloat(mousePos.x);
-    //     const y: i32 = @intFromFloat(mousePos.y);
-    //
-    //     rl.drawPixel(x, y, .white);
-    //
-    //     rl.drawText("Salut", 200, 200, 20, .light_gray);
-    //     rl.drawFPS(600, 600);
-    // }
 }
